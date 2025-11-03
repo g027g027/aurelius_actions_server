@@ -1,30 +1,13 @@
 # server.py
 import os
-from typing import List, Optional, Dict
+from typing import List, Optional
 
-# ---- FastAPI core & OpenAPI patch ----
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 
-# ---- Data/graphics/PDF ----
-import csv
-import pandas as pd
-
-# Use non-interactive backend BEFORE importing pyplot
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-
-
-# ---------------------------
-# App & CORS
-# ---------------------------
 app = FastAPI(
     title="Professor Aurelius Actions API",
     description=(
@@ -43,13 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Public URL for OpenAPI “servers” (Render sets this automatically, but we also allow manual)
 PUBLIC_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-
-
-# ---------------------------
-# Files dir & helpers
-# ---------------------------
 FILES_DIR = "/tmp/aurelius_files"
 os.makedirs(FILES_DIR, exist_ok=True)
 
@@ -57,18 +34,10 @@ def public_url(request: Request, filename: str) -> str:
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     return f"{base}/files/{filename}"
 
-
-# ---------------------------
-# Health
-# ---------------------------
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Professor Aurelius Actions API"}
 
-
-# ---------------------------
-# Static files endpoint
-# ---------------------------
 @app.get("/files/{filename}")
 def get_file(filename: str):
     path = os.path.join(FILES_DIR, filename)
@@ -76,10 +45,7 @@ def get_file(filename: str):
         return {"error": "file_not_found"}
     return FileResponse(path)
 
-
-# ---------------------------
-# 1) schedule_study (demo)
-# ---------------------------
+# ---------- 1) schedule_study ----------
 class Studiepass(BaseModel):
     ämne: str
     datum: str
@@ -92,20 +58,14 @@ class ScheduleRequest(BaseModel):
 
 @app.post("/schedule_study")
 def schedule_study(payload: ScheduleRequest):
-    # Demo: simulate created IDs. (Hook to Google Calendar if desired.)
     created_ids = [f"evt_{i+1}" for i, _ in enumerate(payload.pass_)]
-    return {
-        "message": "Studiepass registrerade (demo). Koppla till Google Calendar för riktig skrivning.",
-        "created_ids": created_ids,
-    }
+    return {"message": "Studiepass registrerade (demo).", "created_ids": created_ids}
 
-
-# ---------------------------
-# 2) generate_flashcards
-# ---------------------------
+# ---------- 2) generate_flashcards ----------
+import csv
 class FlashReq(BaseModel):
     topic: str
-    par: List[List[str]]  # [front, back]
+    par: List[List[str]]
 
 @app.post("/generate_flashcards")
 def generate_flashcards(payload: FlashReq, request: Request):
@@ -113,17 +73,14 @@ def generate_flashcards(payload: FlashReq, request: Request):
     filename = f"{safe_topic}_flashcards.csv"
     path = os.path.join(FILES_DIR, filename)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Framsida", "Baksida"])
+        w = csv.writer(f)
+        w.writerow(["Framsida", "Baksida"])
         for pair in payload.par:
             if len(pair) >= 2:
-                writer.writerow([pair[0], pair[1]])
+                w.writerow([pair[0], pair[1]])
     return {"message": f"Skapade {len(payload.par)} flashcards", "download_url": public_url(request, filename)}
 
-
-# ---------------------------
-# 3) tenta_stats
-# ---------------------------
+# ---------- 3) tenta_stats (lazy imports) ----------
 class TentaEntry(BaseModel):
     år: int
     datum: Optional[str] = None
@@ -135,6 +92,11 @@ class TentaStatsReq(BaseModel):
 
 @app.post("/tenta_stats")
 def tenta_stats(payload: TentaStatsReq, request: Request):
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     df = pd.DataFrame([e.model_dump() for e in payload.entries])
     if df.empty:
         return {"sammanfattning": "Inga data", "per_kategori": {}, "trendbild_url": None}
@@ -147,7 +109,6 @@ def tenta_stats(payload: TentaStatsReq, request: Request):
     plt.xlabel("Kategori")
     plt.ylabel("Antal")
     plt.tight_layout()
-
     fname = "tentastatistik.png"
     fpath = os.path.join(FILES_DIR, fname)
     plt.savefig(fpath)
@@ -157,10 +118,7 @@ def tenta_stats(payload: TentaStatsReq, request: Request):
     summary = f"{int(df.shape[0])} uppgifter; {len(per_cat)} kategorier. Vanligast: {common}."
     return {"sammanfattning": summary, "per_kategori": per_cat, "trendbild_url": public_url(request, fname)}
 
-
-# ---------------------------
-# 4) generate_exam
-# ---------------------------
+# ---------- 4) generate_exam ----------
 class Balans(BaseModel):
     gränsvärden: int = 2
     derivata_integral: int = 2
@@ -177,36 +135,33 @@ TEMPLATES = {
     "derivata_integral": "Beräkna (a) derivata, (b) primitiv/integral: …",
     "graf": "Rita grafen till f(x)=…; ange asymptoter, extrempunkter och konvexitet.",
     "bevis": "Formulera och bevisa en vald sats (t.ex. Medelvärdessatsen eller Analysens huvudsats).",
-    "koncept": "Sant/Falskt med motivering: korta konceptfrågor om kontinuitet/deriverbarhet/primitivitet.",
+    "koncept": "Sant/Falskt med motivering om kontinuitet/deriverbarhet/primitivitet.",
 }
 
 @app.post("/generate_exam")
 def generate_exam(payload: ExamReq):
     b = payload.balans or Balans()
     pieces: List[str] = []
-
     def add(cat: str, n: int):
         for _ in range(max(0, n)):
             pieces.append(TEMPLATES[cat])
-
     add("gränsvärden", b.gränsvärden)
     add("derivata_integral", b.derivata_integral)
     add("graf", b.graf)
     add("bevis", b.bevis)
     add("koncept", b.koncept)
-
     return {"titel": "Simulerad tenta i Jana-stil", "uppgifter": pieces, "pdf_url": None}
 
-
-# ---------------------------
-# 5) export_proof (PDF with LaTeX source text)
-# ---------------------------
+# ---------- 5) export_proof (lazy import reportlab) ----------
 class ExportProofReq(BaseModel):
     titel: str
     latex: str
 
 @app.post("/export_proof")
 def export_proof(payload: ExportProofReq, request: Request):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+
     safe_title = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in payload.titel)
     fname = f"{safe_title}.pdf"
     path = os.path.join(FILES_DIR, fname)
@@ -224,10 +179,7 @@ def export_proof(payload: ExportProofReq, request: Request):
 
     return {"message": "PDF skapad (innehåller LaTeX-källan som text).", "pdf_url": public_url(request, fname)}
 
-
-# ---------------------------
-# 6) weekly_report (simple stub)
-# ---------------------------
+# ---------- 6) weekly_report ----------
 class WeeklyReq(BaseModel):
     period: str
     aktiviteter: Optional[List[str]] = None
@@ -244,10 +196,7 @@ def weekly_report(payload: WeeklyReq):
     ]
     return {"sammanfattning": sammanfattning, "rekommendationer": rekommendationer, "pdf_url": None}
 
-
-# ---------------------------
-# 7) gap_analysis (very light heuristic)
-# ---------------------------
+# ---------- 7) gap_analysis ----------
 class GapReq(BaseModel):
     textlogg: str
     nyckelord: Optional[List[str]] = None
@@ -265,10 +214,7 @@ def gap_analysis(payload: GapReq):
         suggestions.append("Gör 3 uppgifter med partiell integration och substitution.")
     return {"problemområden": problems, "förslag": suggestions}
 
-
-# ---------------------------
-# 8) grade_quiz
-# ---------------------------
+# ---------- 8) grade_quiz ----------
 class QuizReq(BaseModel):
     frågor: Optional[List[str]] = None
     rätt_svar: List[str]
@@ -288,39 +234,21 @@ def grade_quiz(payload: QuizReq):
     procent = (rätt / n) * 100 if n else 0.0
     return {"antal_rätt": rätt, "antal_fel": fel, "procent": round(procent, 2), "felindex": felindex}
 
-
-# ---------------------------
-# OpenAPI servers patch (after routes are registered)
-# ---------------------------
+# ---------- OpenAPI servers patch ----------
 def custom_openapi():
-    """
-    Rebuild OpenAPI schema so GPT Builder sees the public Render URL in `servers`.
-    """
     if app.openapi_schema:
         return app.openapi_schema
-
     openapi_schema = get_openapi(
         title=app.title,
         version=app.version,
         description=app.description,
         routes=app.routes,
     )
-
     if PUBLIC_BASE_URL:
         openapi_schema["servers"] = [{"url": PUBLIC_BASE_URL}]
     else:
         openapi_schema["servers"] = [{"url": "/"}]
-
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
 app.openapi = custom_openapi
-
-
-# ---------------------------
-# Entrypoint for Render
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
