@@ -234,6 +234,148 @@ def grade_quiz(payload: QuizReq):
     procent = (rätt / n) * 100 if n else 0.0
     return {"antal_rätt": rätt, "antal_fel": fel, "procent": round(procent, 2), "felindex": felindex}
 
+# --- GitHub repo analyzer (recursive) ---
+from fastapi import Body
+import requests, re
+from urllib.parse import urlparse
+from typing import Tuple, List, Dict
+
+GITHUB_TIMEOUT = 20
+MAX_FILES = 400  # säkerhetstak så vi inte drar igenom enorma repos
+
+def _gh_headers():
+    # Lägg ev. GITHUB_TOKEN i Render → Settings → Environment för högre rate limit
+    token = os.environ.get("GITHUB_TOKEN")
+    h = {"Accept": "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = f"token {token}"
+    return h
+
+def _parse_repo_url(repo_url: str) -> Tuple[str, str, str, str]:
+    """
+    Returnerar (org, repo, ref, path) givet en GitHub URL:
+    - https://github.com/org/repo
+    - https://github.com/org/repo/tree/main/sub/dir
+    """
+    if "github.com" not in repo_url:
+        raise ValueError("Not a GitHub URL")
+    parts = repo_url.split("github.com/")[-1].split("/")
+    org, repo = parts[0], parts[1]
+    ref, path = "main", ""
+    if "/tree/" in repo_url:
+        after = repo_url.split("/tree/")[1]
+        bits = after.split("/", 1)
+        ref = bits[0]
+        path = bits[1] if len(bits) > 1 else ""
+    return org, repo, ref, path
+
+def _contents_api(org: str, repo: str, path: str = "", ref: str = "main") -> str:
+    base = f"https://api.github.com/repos/{org}/{repo}/contents"
+    return f"{base}/{path}" if path else base
+
+def _list_recursive(org: str, repo: str, ref: str, start_path: str = "") -> List[Dict]:
+    """
+    Går rekursivt via GitHub Contents API och returnerar filobjekt.
+    Respekterar MAX_FILES.
+    """
+    stack = [start_path]
+    files = []
+    headers = _gh_headers()
+    seen = set()
+
+    while stack and len(files) < MAX_FILES:
+        path = stack.pop()
+        api = _contents_api(org, repo, path, ref=ref)
+        r = requests.get(api, params={"ref": ref}, headers=headers, timeout=GITHUB_TIMEOUT)
+        if r.status_code != 200:
+            continue
+        items = r.json()
+        if isinstance(items, dict) and items.get("type") == "file":
+            items = [items]
+        for it in items:
+            t = it.get("type")
+            if t == "dir":
+                p = it.get("path")
+                if p and p not in seen:
+                    seen.add(p)
+                    stack.append(p)
+            elif t == "file":
+                files.append(it)
+                if len(files) >= MAX_FILES:
+                    break
+    return files
+
+def _analyze_text_md(text: str) -> Dict:
+    heads = re.findall(r"^#+\s+(.+)$", text, flags=re.M)[:10]
+    code_blocks = len(re.findall(r"```", text))
+    return {"headings": heads, "code_fences": code_blocks}
+
+def _analyze_python(code: str) -> Dict:
+    funcs = len(re.findall(r"^\s*def\s+\w+\(", code, flags=re.M))
+    classes = len(re.findall(r"^\s*class\s+\w+\(", code, flags=re.M))
+    imports = re.findall(r"^\s*(?:from\s+\w+(?:\.\w+)*\s+import|import\s+\w+(?:\.\w+)*)", code, flags=re.M)[:12]
+    return {"functions": funcs, "classes": classes, "imports": imports}
+
+@app.post("/analyze_github_repo")
+def analyze_github_repo(payload: dict = Body(...)):
+    """
+    Input: {"repo_url":"https://github.com/org/repo[/tree/<ref>/<path>]",
+            "extensions":[".py",".md",".pdf",".ipynb"] (optional),
+            "max_files": 400 (optional)}
+    Output: {"status":"ok","count":N,"files":[...]}
+    """
+    repo_url = payload.get("repo_url", "").strip()
+    if not repo_url:
+        return {"status": "error", "message": "Missing repo_url"}
+    try:
+        org, repo, ref, path = _parse_repo_url(repo_url)
+    except Exception:
+        return {"status": "error", "message": "Invalid GitHub URL"}
+
+    exts = tuple([e.lower() for e in payload.get("extensions", [".py",".md",".pdf",".ipynb"])])
+    max_files = int(payload.get("max_files", MAX_FILES))
+
+    # Lista rekursivt
+    files = _list_recursive(org, repo, ref, start_path=path)
+    # Filtrera på extension
+    files = [f for f in files if f.get("type")=="file" and f.get("name","").lower().endswith(exts)]
+    files = files[:max_files]
+
+    summary = []
+    headers = _gh_headers()
+
+    for f in files:
+        name = f.get("name","")
+        size = f.get("size")
+        dl = f.get("download_url")
+        filetype = name.split(".")[-1].lower()
+        row = {"name": name, "path": f.get("path"), "size": size, "type": filetype, "download_url": dl}
+
+        # Lättviktsanalys: bara .py och .md hämtas i text (PDF/IPYNB lämnas som länkar)
+        try:
+            if dl and filetype in ("py","md"):
+                r = requests.get(dl, headers=headers, timeout=GITHUB_TIMEOUT)
+                if r.status_code == 200:
+                    text = r.text
+                    if filetype == "py":
+                        row.update(_analyze_python(text))
+                    elif filetype == "md":
+                        row.update(_analyze_text_md(text))
+        except Exception:
+            pass
+
+        summary.append(row)
+
+    return {
+        "status": "ok",
+        "count": len(summary),
+        "ref": ref,
+        "repo": f"{org}/{repo}",
+        "root": path or "",
+        "files": summary
+    }
+
+
 # ---------- OpenAPI servers patch ----------
 def custom_openapi():
     if app.openapi_schema:
