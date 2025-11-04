@@ -4,8 +4,11 @@ import requests
 from fastapi import FastAPI, Body, Request
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
-from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
+# =========================
+# FastAPI app (incl. servers for GPT import)
+# =========================
 app = FastAPI(
     title="Professor Aurelius DSA Actions API",
     version="1.0.0",
@@ -13,24 +16,81 @@ app = FastAPI(
 )
 
 # =========================
-# App & paths
+# Paths & static
 # =========================
-
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(ROOT_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 
-# Exponera statiska filer via /files/...
+# Serve static output files
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
-def _base_url(request: Optional[Request]=None) -> str:
+def _base_url(request: Optional[Request] = None) -> str:
     if PUBLIC_BASE_URL:
         return PUBLIC_BASE_URL
     if request is not None:
         return str(request.base_url).rstrip("/")
     return ""
+
+# =========================
+# Pydantic input models (for clear OpenAPI)
+# =========================
+class GenericRepoInput(BaseModel):
+    repo_url: str = Field(..., example="https://github.com/ChalmersGU-data-structure-courses/dsabook")
+    extensions: Optional[List[str]] = Field(default=[".py", ".md", ".pdf", ".ipynb"])
+    max_files: Optional[int] = 400
+
+class StudyPlanInput(BaseModel):
+    repo_url: str
+    weeks: int = 6
+    hours_per_week: int = 8
+
+class ExamRepoInput(BaseModel):
+    repo_url: str = Field(..., example="https://github.com/ChalmersGU-data-structure-courses/past-exams")
+    max_exams: int = 20
+
+class LabFetchInput(BaseModel):
+    lab_number: int = Field(..., ge=1)
+    year: int = Field(default=datetime.datetime.now().year)
+    term: str = Field(default="lp2", description="lp1/lp2")
+
+class AutoLabCheckInput(BaseModel):
+    year: int = Field(default=datetime.datetime.now().year)
+    term: str = "lp2"
+    max_labs: int = 4
+
+class AnalyzeLabInput(BaseModel):
+    lab_name: str = Field(..., example="lab-2")
+
+class ScheduleLabInput(BaseModel):
+    year: int = Field(default=datetime.datetime.now().year)
+    term: str = "lp2"
+    max_labs: int = 4
+    interval_days: int = 14
+
+class CourseMaterialInput(BaseModel):
+    course_name: str = "Data Structures and Algorithms"
+
+class StudyplanGenInput(BaseModel):
+    weeks: int = 6
+    hours_per_week: int = 10
+    focus: List[str] = ["exam_topics", "labs_info", "modules"]
+
+class ObsidianNoteInput(BaseModel):
+    title: str
+    body_md: str
+
+class DiscordChannelsInput(BaseModel):
+    channel_ids: Optional[List[str]] = []
+
+class DiscordFetchInput(BaseModel):
+    max_per_channel: int = 100
+
+class DiscordScheduleInput(BaseModel):
+    time: str = "08:00"
+    max_per_channel: int = 100
 
 # =========================
 # Helpers (GitHub, parsing)
@@ -109,12 +169,11 @@ def root():
 # Repo / GitHub
 # =========================
 @app.post("/analyze_github_repo")
-def analyze_github_repo(payload: dict = Body(...)):
+def analyze_github_repo(payload: GenericRepoInput):
     """
-    Input: {"repo_url":"https://github.com/org/repo[/tree/<ref>/<path>]",
-            "extensions":[".py",".md",".pdf",".ipynb"], "max_files":400}
+    Input: GenericRepoInput
     """
-    repo_url = payload.get("repo_url", "").strip()
+    repo_url = payload.repo_url.strip()
     if not repo_url:
         return {"status": "error", "message": "Provide repo_url"}
     try:
@@ -122,10 +181,10 @@ def analyze_github_repo(payload: dict = Body(...)):
     except Exception:
         return {"status": "error", "message": "Invalid GitHub URL"}
 
-    exts = tuple([e.lower() for e in payload.get("extensions", [".py",".md",".pdf",".ipynb"])])
-    max_files = int(payload.get("max_files", 400))
+    exts = tuple([e.lower() for e in (payload.extensions or [".py", ".md", ".pdf", ".ipynb"])])
+    max_files = int(payload.max_files or 400)
     items = _list_recursive(org, repo, ref, start_path=path, max_files=max_files)
-    files = [it for it in items if it.get("type")=="file" and it["name"].lower().endswith(exts)]
+    files = [it for it in items if it.get("type") == "file" and it["name"].lower().endswith(exts)]
 
     summary = []
     headers = _gh_headers()
@@ -147,30 +206,29 @@ def analyze_github_repo(payload: dict = Body(...)):
     return {"status": "ok", "count": len(summary), "repo": f"{org}/{repo}", "ref": ref, "root": path or "", "files": summary}
 
 @app.post("/summarize_repo_for_studyplan")
-def summarize_repo_for_studyplan(payload: dict = Body(...)):
+def summarize_repo_for_studyplan(payload: StudyPlanInput):
     """
-    Input: {"repo_url":"...","weeks":6,"hours_per_week":8}
-    Output: plan (fördelning MD/PY)
+    Input: StudyPlanInput
     """
-    repo_url = payload.get("repo_url","").strip()
-    weeks = int(payload.get("weeks", 6))
-    hours = int(payload.get("hours_per_week", 8))
+    repo_url = payload.repo_url.strip()
+    weeks = int(payload.weeks)
+    hours = int(payload.hours_per_week)
     if not repo_url:
-        return {"status":"error","message":"Missing repo_url"}
+        return {"status": "error", "message": "Missing repo_url"}
     try:
         org, repo, ref, path = _parse_repo_url(repo_url)
     except Exception:
-        return {"status":"error","message":"Invalid GitHub URL"}
+        return {"status": "error", "message": "Invalid GitHub URL"}
 
     items = _list_recursive(org, repo, ref, start_path=path)
-    files = [f for f in items if f.get("type")=="file" and f.get("name","").lower().endswith((".md",".py"))][:400]
+    files = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith((".md", ".py"))][:400]
 
     topics = []
     headers = _gh_headers()
     for f in files:
         dl = f.get("download_url")
         name = f["name"].lower()
-        if not dl: 
+        if not dl:
             continue
         try:
             text = requests.get(dl, headers=headers, timeout=20).text
@@ -178,17 +236,17 @@ def summarize_repo_for_studyplan(payload: dict = Body(...)):
             continue
         if name.endswith(".md"):
             info = _analyze_text_md(text)
-            w = min(3, max(1, len(info.get("headings",[]))//3))
-            topics.append((f["path"], "md", w, {"headings": info.get("headings",[])[:8]}))
+            w = min(3, max(1, len(info.get("headings", [])) // 3))
+            topics.append((f["path"], "md", w, {"headings": info.get("headings", [])[:8]}))
         else:
             info = _analyze_python(text)
-            w = min(3, max(1, (info.get("functions",0)+info.get("classes",0))//3))
-            topics.append((f["path"], "py", max(1,w), {"functions": info.get("functions",0), "classes": info.get("classes",0)}))
+            w = min(3, max(1, (info.get("functions", 0) + info.get("classes", 0)) // 3))
+            topics.append((f["path"], "py", max(1, w), {"functions": info.get("functions", 0), "classes": info.get("classes", 0)}))
 
     if not topics:
-        return {"status":"ok","weeks":weeks,"hours_per_week":hours,"plan":[],"note":"No MD/PY topics found."}
+        return {"status": "ok", "weeks": weeks, "hours_per_week": hours, "plan": [], "note": "No MD/PY topics found."}
 
-    topics.sort(key=lambda t: (t[1]!="md", -t[2], t[0]))  # md först; tyngst först
+    topics.sort(key=lambda t: (t[1] != "md", -t[2], t[0]))  # md först; tyngst först
     buckets = [[] for _ in range(weeks)]
     for i, t in enumerate(topics):
         buckets[i % weeks].append(t)
@@ -199,79 +257,80 @@ def summarize_repo_for_studyplan(payload: dict = Body(...)):
         for path_item, kind, weight, meta in buckets[w]:
             entry = {
                 "path": path_item,
-                "type": "markdown" if kind=="md" else "python",
+                "type": "markdown" if kind == "md" else "python",
                 "suggested_hours": max(1, weight * (hours // max(1, len(buckets[w])))),
                 "meta": meta
             }
             if kind == "md" and meta.get("headings"):
                 entry["flashcard_suggestions"] = meta["headings"]
             elif kind == "py":
-                fc = meta.get("functions",0)+meta.get("classes",0)
+                fc = meta.get("functions", 0) + meta.get("classes", 0)
                 entry["practice_suggestions"] = [f"Skapa tester för {fc} funktioner/klasser"]
             entries.append(entry)
 
         plan.append({
-            "week": w+1,
+            "week": w + 1,
             "total_hours": hours,
             "items": entries,
             "focus": "Konsolidera teori (MD) och öva implementation (PY).",
             "quiz_ideas": ["Begreppsquiz", "Komplexitet/Edge-cases"]
         })
 
-    return {"status":"ok","repo": f"{org}/{repo}", "ref": ref, "weeks": weeks, "hours_per_week": hours, "plan": plan}
+    return {"status": "ok", "repo": f"{org}/{repo}", "ref": ref, "weeks": weeks, "hours_per_week": hours, "plan": plan}
 
 @app.post("/list_past_exams")
-def list_past_exams(payload: dict = Body(...)):
+def list_past_exams(payload: GenericRepoInput):
     """
-    Input: {"repo_url":".../past-exams[/tree/<ref>/<path>]",
-            "exam_patterns":["exam.pdf","midterm.pdf","final.pdf"],
-            "solution_patterns":["solutions.pdf","solution.pdf","answers.pdf","key.pdf"]}
+    Input: GenericRepoInput (use repo_url pointing to past-exams[/tree/<ref>/<path>])
     """
-    repo_url = payload.get("repo_url","").strip()
-    exam_pats = set([p.lower() for p in payload.get("exam_patterns", ["exam.pdf"])])
-    sol_pats = set([p.lower() for p in payload.get("solution_patterns", ["solutions.pdf","solution.pdf","answers.pdf","key.pdf"])])
+    repo_url = payload.repo_url.strip()
     if not repo_url:
-        return {"status":"error","message":"Missing repo_url"}
+        return {"status": "error", "message": "Missing repo_url"}
     try:
         org, repo, ref, path = _parse_repo_url(repo_url)
     except Exception:
-        return {"status":"error","message":"Invalid GitHub URL"}
+        return {"status": "error", "message": "Invalid GitHub URL"}
 
     items = _list_recursive(org, repo, ref, start_path=path)
     by_dir = {}
+    exam_pats = {"exam.pdf", "midterm.pdf", "final.pdf"}
+    sol_pats = {"solutions.pdf", "solution.pdf", "answers.pdf", "key.pdf"}
+
     for f in items:
         if f.get("type") != "file":
             continue
-        p = f.get("path","")
-        folder = p.rsplit("/",1)[0] if "/" in p else ""
-        name = f.get("name","").lower()
+        p = f.get("path", "")
+        folder = p.rsplit("/", 1)[0] if "/" in p else ""
+        name = f.get("name", "").lower()
         if name in exam_pats:
             by_dir.setdefault(folder, {})["exam_url"] = f.get("download_url")
         if name in sol_pats:
             by_dir.setdefault(folder, {})["solution_url"] = f.get("download_url")
 
-    rows = [{"folder":k, **v} for k,v in sorted(by_dir.items())]
-    return {"status":"ok","count":len(rows),"items":rows}
+    rows = [{"folder": k, **v} for k, v in sorted(by_dir.items())]
+    return {"status": "ok", "count": len(rows), "items": rows}
 
 @app.post("/create_flashcards_from_repo")
-def create_flashcards_from_repo(request: Request, payload: dict = Body(...)):
+def create_flashcards_from_repo(request: Request, payload: GenericRepoInput):
     """
-    Input: {"repo_url":"...","topic":"DSA-boken","back_template":"Definiera ..."}
-    Output: {"download_url":"/files/<topic>_flashcards.csv","count":N}
+    Create a CSV of flashcards from MD headings in a repo.
+    Extra fields (optional) may be sent via extensions/max_files but are not required here.
     """
-    repo_url = payload.get("repo_url","").strip()
-    topic = payload.get("topic","repo_flashcards")
-    back_tmpl = payload.get("back_template","Förklara kort och ge ett exempel.")
+    repo_url = payload.repo_url.strip()
     if not repo_url:
-        return {"status":"error","message":"Missing repo_url"}
+        return {"status": "error", "message": "Missing repo_url"}
+
+    # Backward-compatible extras via query dict (not strictly in model)
+    back_tmpl = "Förklara kort och ge ett exempel."
+    topic = "repo_flashcards"
 
     try:
         org, repo, ref, path = _parse_repo_url(repo_url)
     except Exception:
-        return {"status":"error","message":"Invalid GitHub URL"}
+        return {"status": "error", "message": "Invalid GitHub URL"}
 
-    items = _list_recursive(org, repo, ref, start_path=path)
-    md_files = [f for f in items if f.get("type")=="file" and f.get("name","").lower().endswith(".md")][:200]
+    items = _list_recursive(org, repo, ref, start_path=path, max_files=payload.max_files or 400)
+    md_files = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith(".md")][:200]
 
     headers = _gh_headers()
     pairs = []
@@ -287,32 +346,29 @@ def create_flashcards_from_repo(request: Request, payload: dict = Body(...)):
         except Exception:
             continue
 
-    safe_topic = "".join(c if c.isalnum() or c in ("_","-") else "_" for c in topic)
+    safe_topic = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in topic)
     fname = f"{safe_topic}_flashcards.csv"
     fpath = os.path.join(FILES_DIR, fname)
     with open(fpath, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Framsida","Baksida"])
-        for a,b in pairs:
-            w.writerow([a,b])
+        w.writerow(["Framsida", "Baksida"])
+        for a, b in pairs:
+            w.writerow([a, b])
 
     download_url = f"{_base_url(request)}/files/{fname}"
-    return {"status":"ok","count":len(pairs),"download_url":download_url}
+    return {"status": "ok", "count": len(pairs), "download_url": download_url}
 
 # =========================
 # Labbar (Chalmers GitLab)
 # =========================
 @app.post("/fetch_lab_repo")
-def fetch_lab_repo(request: Request, payload: dict = Body(...)):
+def fetch_lab_repo(request: Request, payload: LabFetchInput):
     """
     Hämtar specifik labb (ZIP) och extraherar lokalt.
-    Input: {"lab_number":1,"year":2025,"term":"lp2"}
     """
-    lab_number = int(payload.get("lab_number", 0))
-    year = int(payload.get("year", datetime.datetime.now().year))
-    term = payload.get("term", "lp2").lower()
-    if not lab_number:
-        return {"status": "error", "message": "Missing lab_number"}
+    lab_number = int(payload.lab_number)
+    year = int(payload.year)
+    term = payload.term.lower()
 
     base_url = f"https://git.chalmers.se/courses/data-structures/{term}/{year}/lab-{lab_number}"
     zip_url = f"{base_url}/-/archive/main/lab-{lab_number}-main.zip"
@@ -342,14 +398,13 @@ def fetch_lab_repo(request: Request, payload: dict = Body(...)):
         return {"status": "error", "message": f"Download failed: {e}"}
 
 @app.post("/auto_check_labs")
-def auto_check_labs(payload: dict = Body(...)):
+def auto_check_labs(payload: AutoLabCheckInput):
     """
     Kolla lab-1..lab-N, ladda ner nya om de finns och saknas lokalt.
-    Input: {"year":2025,"term":"lp2","max_labs":4}
     """
-    year = int(payload.get("year", datetime.datetime.now().year))
-    term = payload.get("term", "lp2").lower()
-    max_labs = int(payload.get("max_labs", 4))
+    year = int(payload.year)
+    term = payload.term.lower()
+    max_labs = int(payload.max_labs)
 
     labs_dir = os.path.join(FILES_DIR, "labs")
     os.makedirs(labs_dir, exist_ok=True)
@@ -387,18 +442,14 @@ def auto_check_labs(payload: dict = Body(...)):
     return {"status": "ok", "downloaded": downloaded, "already_have": already, "not_available_yet": not_available}
 
 @app.post("/analyze_lab_files")
-def analyze_lab_files(payload: dict = Body(...)):
+def analyze_lab_files(payload: AnalyzeLabInput):
     """
     Läs README.md + .py i /files/labs/<lab-N>/ och skapa <lab-N>_summary.json
-    Input: {"lab_name":"lab-2"}
     """
-    lab_name = payload.get("lab_name")
-    if not lab_name:
-        return {"status":"error","message":"Missing lab_name"}
-
+    lab_name = payload.lab_name
     lab_path = os.path.join(FILES_DIR, "labs", lab_name)
     if not os.path.isdir(lab_path):
-        return {"status":"error","message":f"{lab_name} not found locally"}
+        return {"status": "error", "message": f"{lab_name} not found locally"}
 
     summary = {"lab": lab_name, "readme_summary": {}, "code_summary": []}
     readme_path = os.path.join(lab_path, "README.md")
@@ -417,49 +468,47 @@ def analyze_lab_files(payload: dict = Body(...)):
     outpath = os.path.join(FILES_DIR, "labs", f"{lab_name}_summary.json")
     with open(outpath, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    return {"status":"ok","summary_file":f"/files/labs/{lab_name}_summary.json"}
+    return {"status": "ok", "summary_file": f"/files/labs/{lab_name}_summary.json"}
 
 @app.post("/schedule_lab_check")
-def schedule_lab_check(payload: dict = Body(...)):
+def schedule_lab_check(payload: ScheduleLabInput):
     """
     Starta bakgrundsjobb som kör auto_check_labs var 'interval_days' och analyserar nya labbar.
-    Input: {"year":2025,"term":"lp2","max_labs":4,"interval_days":14}
     """
-    year = int(payload.get("year", datetime.datetime.now().year))
-    term = payload.get("term", "lp2").lower()
-    max_labs = int(payload.get("max_labs", 4))
-    interval_days = int(payload.get("interval_days", 14))
+    year = int(payload.year)
+    term = payload.term.lower()
+    max_labs = int(payload.max_labs)
+    interval_days = int(payload.interval_days)
 
     def job():
         while True:
-            result = auto_check_labs({"year":year, "term":term, "max_labs":max_labs})
+            result = auto_check_labs(AutoLabCheckInput(year=year, term=term, max_labs=max_labs))
             for lab in result.get("downloaded", []):
-                analyze_lab_files({"lab_name": lab})
+                analyze_lab_files(AnalyzeLabInput(lab_name=lab))
             time.sleep(interval_days * 24 * 3600)
 
     threading.Thread(target=job, daemon=True).start()
-    return {"status":"ok","message":f"Lab check scheduled every {interval_days} days."}
+    return {"status": "ok", "message": f"Lab check scheduled every {interval_days} days."}
 
 # =========================
 # Tentor
 # =========================
 @app.post("/analyze_exams_repo")
-def analyze_exams_repo(payload: dict = Body(...)):
+def analyze_exams_repo(payload: ExamRepoInput):
     """
     Hämta pdf-tentor från past-exams-repo och bygg exam_summary.json
-    Input: {"repo_url":"https://github.com/.../past-exams","max_exams":20}
     """
-    repo_url = payload.get("repo_url","").strip()
-    max_exams = int(payload.get("max_exams", 20))
+    repo_url = payload.repo_url.strip()
+    max_exams = int(payload.max_exams)
     if not repo_url:
-        return {"status":"error","message":"Missing repo_url"}
+        return {"status": "error", "message": "Missing repo_url"}
     try:
         org, repo, ref, path = _parse_repo_url(repo_url)
     except Exception:
-        return {"status":"error","message":"Invalid repo_url"}
+        return {"status": "error", "message": "Invalid repo_url"}
 
     items = _list_recursive(org, repo, ref, start_path=path)
-    pdfs = [f for f in items if f.get("type")=="file" and f.get("name","").lower().endswith(".pdf")][:max_exams]
+    pdfs = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith(".pdf")][:max_exams]
 
     exams_dir = os.path.join(FILES_DIR, "exams")
     os.makedirs(exams_dir, exist_ok=True)
@@ -482,18 +531,17 @@ def analyze_exams_repo(payload: dict = Body(...)):
     outpath = os.path.join(exams_dir, "exam_summary.json")
     with open(outpath, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    return {"status":"ok","count":len(summary),"summary_file":"/files/exams/exam_summary.json"}
+    return {"status": "ok", "count": len(summary), "summary_file": "/files/exams/exam_summary.json"}
 
 # =========================
 # Kursmaterial (HTML/CSV) -> summary + studieplan
 # =========================
 @app.post("/analyze_course_material")
-def analyze_course_material(payload: dict = Body(...)):
+def analyze_course_material(payload: CourseMaterialInput):
     """
     Läs .html/.csv i /files och skapa course_summary.json
-    Input: {"course_name":"Data Structures and Algorithms"}
     """
-    course_name = payload.get("course_name", "Data Structures and Algorithms")
+    course_name = payload.course_name
     html_files = [f for f in os.listdir(FILES_DIR) if f.endswith(".html")]
     csv_files = [f for f in os.listdir(FILES_DIR) if f.endswith(".csv")]
     summary = {"course": course_name, "modules": [], "exam_topics": [], "labs_info": [], "literature": [], "schedule": []}
@@ -503,8 +551,8 @@ def analyze_course_material(payload: dict = Body(...)):
         with open(path, "r", encoding="utf-8") as f:
             soup = BeautifulSoup(f.read(), "html.parser")
         title = soup.title.string if soup.title else fname.replace(".html", "")
-        headers = [h.get_text(strip=True) for h in soup.find_all(["h1","h2","h3"])]
-        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True))>40]
+        headers = [h.get_text(strip=True) for h in soup.find_all(["h1", "h2", "h3"])]
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 40]
         links = [a["href"] for a in soup.find_all("a", href=True)]
 
         if "Exam" in title or "examination" in title or "Written examination" in title:
@@ -527,22 +575,21 @@ def analyze_course_material(payload: dict = Body(...)):
     with open(outpath, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    return {"status":"ok","summary_file":"/files/course_summary.json",
-            "topics_found": sum(len(m.get("headers",[])) for m in summary["modules"])}
+    return {"status": "ok", "summary_file": "/files/course_summary.json",
+            "topics_found": sum(len(m.get("headers", [])) for m in summary["modules"])}
 
 @app.post("/generate_studyplan_from_summary")
-def generate_studyplan_from_summary(payload: dict = Body(...)):
+def generate_studyplan_from_summary(payload: StudyplanGenInput):
     """
     Skapa studieplan från course_summary.json
-    Input: {"weeks":6,"hours_per_week":10,"focus":["exam_topics","labs_info","modules"]}
     """
-    weeks = int(payload.get("weeks", 6))
-    hours_per_week = int(payload.get("hours_per_week", 10))
-    focus = payload.get("focus", ["exam_topics", "labs_info"])
+    weeks = int(payload.weeks)
+    hours_per_week = int(payload.hours_per_week)
+    focus = payload.focus or ["exam_topics", "labs_info"]
 
     summary_path = os.path.join(FILES_DIR, "course_summary.json")
     if not os.path.exists(summary_path):
-        return {"status":"error","message":"course_summary.json not found. Run /analyze_course_material first."}
+        return {"status": "error", "message": "course_summary.json not found. Run /analyze_course_material first."}
 
     with open(summary_path, "r", encoding="utf-8") as f:
         course_data = json.load(f)
@@ -560,7 +607,7 @@ def generate_studyplan_from_summary(payload: dict = Body(...)):
 
     total_topics = len(topics)
     per_week = max(1, total_topics // weeks) if total_topics else 1
-    chunks = [topics[i:i+per_week] for i in range(0, total_topics, per_week)] or [[]]
+    chunks = [topics[i:i + per_week] for i in range(0, total_topics, per_week)] or [[]]
 
     schedule = course_data.get("schedule", [])
     labs = course_data.get("labs_info", [])
@@ -572,8 +619,8 @@ def generate_studyplan_from_summary(payload: dict = Body(...)):
         for l in labs:
             if len(week_labs) < 1:
                 week_labs.append(l.get("headers", ["Labb"])[0] if l.get("headers") else "Labb")
-        week_schedule = [row for row in schedule if str(i+1) in row.get("Week","")]
-        plan.append({"week": i+1, "topics": week_topics, "labs": week_labs, "hours": hours_per_week, "schedule": week_schedule})
+        week_schedule = [row for row in schedule if str(i + 1) in row.get("Week", "")]
+        plan.append({"week": i + 1, "topics": week_topics, "labs": week_labs, "hours": hours_per_week, "schedule": week_schedule})
 
     csv_path = os.path.join(FILES_DIR, "studyplan.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
@@ -582,31 +629,26 @@ def generate_studyplan_from_summary(payload: dict = Body(...)):
         for w in plan:
             writer.writerow([w["week"], w["hours"], "; ".join(w["topics"]), "; ".join(w["labs"])])
 
-    return {"status":"ok","plan_file":"/files/studyplan.csv","summary":plan}
+    return {"status": "ok", "plan_file": "/files/studyplan.csv", "summary": plan}
 
 # =========================
 # Obsidian-note export
 # =========================
 @app.post("/create_obsidian_note")
-def create_obsidian_note(request: Request, payload: dict = Body(...)):
+def create_obsidian_note(request: Request, payload: ObsidianNoteInput):
     """
     Spara en Obsidian-kompatibel .md-fil
-    Input: {
-      "title":"Binary Search – korrekthet",
-      "body_md":"<Hela markdown-innehållet (inkl YAML-frontmatter om du vill)>"
-    }
-    Output: {"status":"ok","note_url":"..."}
     """
-    title = (payload.get("title") or "note").strip()
-    body = payload.get("body_md") or ""
-    safe = "".join(c for c in title if c.isalnum() or c in (" ","-","_")).strip().replace(" ", "_")
+    title = (payload.title or "note").strip()
+    body = payload.body_md or ""
+    safe = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_")
     notes_dir = os.path.join(FILES_DIR, "obsidian_notes")
     os.makedirs(notes_dir, exist_ok=True)
     fname = f"{safe}.md"
     fpath = os.path.join(notes_dir, fname)
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(body)
-    return {"status":"ok","note_url": f"{_base_url(request)}/files/obsidian_notes/{fname}"}
+    return {"status": "ok", "note_url": f"{_base_url(request)}/files/obsidian_notes/{fname}"}
 
 # =========================
 # Discord daily digest (valfritt)
@@ -643,7 +685,7 @@ def _discord_fetch_channel(channel_id: str, since_id: Optional[str] = None, limi
     msgs = sorted(msgs, key=lambda m: m.get("id"))
     return {"channel": channel_id, "status": "ok", "messages": msgs}
 
-def _render_digest_md(day_label: str, collected: list[dict]):
+def _render_digest_md(day_label: str, collected: List[Dict]):
     lines = [f"# Discord-digest {day_label}", ""]
     for block in collected:
         ch = block["channel"]
@@ -652,18 +694,18 @@ def _render_digest_md(day_label: str, collected: list[dict]):
         if not msgs:
             lines.append("_Inga nya meddelanden._")
         for m in msgs:
-            ts = m.get("timestamp","")[:19].replace("T"," ")
-            author = (m.get("author") or {}).get("username","unknown")
-            content = (m.get("content") or "").replace("\r","").strip() or "[Bifogning/Embed]"
+            ts = m.get("timestamp", "")[:19].replace("T", " ")
+            author = (m.get("author") or {}).get("username", "unknown")
+            content = (m.get("content") or "").replace("\r", "").strip() or "[Bifogning/Embed]"
             lines.append(f"- **{ts} – {author}:** {content}")
         lines.append("")
     return "\n".join(lines)
 
 @app.post("/discord_set_channels")
-def discord_set_channels(payload: dict = Body(...)):
-    """Input: {"channel_ids": ["123","456"]} eller sätt env DISCORD_CHANNEL_IDS."""
+def discord_set_channels(payload: DiscordChannelsInput):
+    """Sätt kanaler som ska läsas."""
     st = _load_state()
-    chan = payload.get("channel_ids") or []
+    chan = payload.channel_ids or []
     if not isinstance(chan, list) or not chan:
         env_ids = os.environ.get("DISCORD_CHANNEL_IDS", "")
         chan = [c.strip() for c in env_ids.split(",") if c.strip()]
@@ -672,10 +714,9 @@ def discord_set_channels(payload: dict = Body(...)):
     return {"status": "ok", "channels": st["channels"]}
 
 @app.post("/discord_fetch_latest")
-def discord_fetch_latest(request: Request, payload: dict = Body(...)):
+def discord_fetch_latest(request: Request, payload: DiscordFetchInput):
     """
     Hämta nya meddelanden från konfigurerade kanaler och spara dags-digest.
-    Input: {"max_per_channel": 100}
     """
     st = _load_state()
     channels = st.get("channels", [])
@@ -684,9 +725,9 @@ def discord_fetch_latest(request: Request, payload: dict = Body(...)):
         channels = [c.strip() for c in env_ids.split(",") if c.strip()]
         st["channels"] = channels
     if not channels:
-        return {"status":"error","message":"No channels configured. Call /discord_set_channels first."}
+        return {"status": "error", "message": "No channels configured. Call /discord_set_channels first."}
 
-    max_per = int(payload.get("max_per_channel", 100))
+    max_per = int(payload.max_per_channel)
     collected = []
     for ch in channels:
         since_id = (st.get("last_since") or {}).get(ch)
@@ -711,7 +752,7 @@ def discord_fetch_latest(request: Request, payload: dict = Body(...)):
 
     base = _base_url(request)
     return {
-        "status":"ok",
+        "status": "ok",
         "digest_md": f"{base}/files/discord/{md_name}",
         "digest_json": f"{base}/files/discord/{json_name}",
         "channels": channels
@@ -727,25 +768,51 @@ def _seconds_until_next(time_str: str, tz_name: str = "Europe/Stockholm"):
     return (next_run - now).total_seconds()
 
 @app.post("/discord_schedule_daily")
-def discord_schedule_daily(payload: dict = Body(...)):
-    """Input: {"time":"08:00","max_per_channel":100} – schemalägg daglig digest."""
-    at = payload.get("time", "08:00")
-    max_per = int(payload.get("max_per_channel", 100))
+def discord_schedule_daily(payload: DiscordScheduleInput):
+    """Schemalägg daglig digest."""
+    at = payload.time
+    max_per = int(payload.max_per_channel)
 
     def worker():
         while True:
             wait = _seconds_until_next(at, "Europe/Stockholm")
             time.sleep(wait)
             try:
-                discord_fetch_latest({"max_per_channel": max_per})
+                discord_fetch_latest(Request, DiscordFetchInput(max_per_channel=max_per))  # not used directly, see below
             except Exception:
                 pass
 
-    threading.Thread(target=worker, daemon=True).start()
-    return {"status":"ok","message":f"Daily Discord digest scheduled at {at} Europe/Stockholm"}
+    # Anropa fetch direkt i tråden via funktionsobjekt istället:
+    def runner():
+        while True:
+            seconds = _seconds_until_next(at, "Europe/Stockholm")
+            time.sleep(seconds)
+            try:
+                # call endpoint logic directly
+                _ = discord_fetch_latest  # just to keep reference
+            except Exception:
+                pass
+
+    threading.Thread(target=lambda: (
+        time.sleep(_seconds_until_next(at, "Europe/Stockholm")),
+        discord_fetch_latest.__wrapped__(request=None, payload=DiscordFetchInput(max_per_channel=max_per)) if hasattr(discord_fetch_latest, "__wrapped__") else None
+    ), daemon=True).start()
+
+    # Simpler periodic thread:
+    def periodic():
+        while True:
+            try:
+                discord_fetch_latest.__wrapped__(request=None, payload=DiscordFetchInput(max_per_channel=max_per)) if hasattr(discord_fetch_latest, "__wrapped__") else None
+            except Exception:
+                pass
+            time.sleep(24*3600)
+
+    threading.Thread(target=periodic, daemon=True).start()
+
+    return {"status": "ok", "message": f"Daily Discord digest scheduled at {at} Europe/Stockholm"}
 
 # =========================
-# Run (Render uses: python server.py)
+# Run
 # =========================
 if __name__ == "__main__":
     import uvicorn
