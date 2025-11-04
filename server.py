@@ -4,11 +4,18 @@ import requests
 from fastapi import FastAPI, Body, Request
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="Professor Aurelius DSA Actions API",
+    version="1.0.0",
+    servers=[{"url": "https://aurelius-actions-server.onrender.com"}]
+)
 
 # =========================
 # App & paths
 # =========================
-app = FastAPI(title="Professor Aurelius DSA Actions API")
+
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(ROOT_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
