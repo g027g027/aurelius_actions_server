@@ -1,7 +1,7 @@
 import os, io, csv, re, json, zipfile, datetime, threading, time
 from typing import Tuple, List, Dict, Optional
 import requests
-from fastapi import FastAPI, Body, Request
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
@@ -91,6 +91,10 @@ class DiscordFetchInput(BaseModel):
 class DiscordScheduleInput(BaseModel):
     time: str = "08:00"
     max_per_channel: int = 100
+
+# NEW: import files via URL (Option B)
+class ImportFilesInput(BaseModel):
+    urls: List[str] = Field(..., description="List of absolute URLs to fetch and store under /files")
 
 # =========================
 # Helpers (GitHub, parsing)
@@ -314,13 +318,11 @@ def list_past_exams(payload: GenericRepoInput):
 def create_flashcards_from_repo(request: Request, payload: GenericRepoInput):
     """
     Create a CSV of flashcards from MD headings in a repo.
-    Extra fields (optional) may be sent via extensions/max_files but are not required here.
     """
     repo_url = payload.repo_url.strip()
     if not repo_url:
         return {"status": "error", "message": "Missing repo_url"}
 
-    # Backward-compatible extras via query dict (not strictly in model)
     back_tmpl = "Förklara kort och ge ett exempel."
     topic = "repo_flashcards"
 
@@ -632,26 +634,45 @@ def generate_studyplan_from_summary(payload: StudyplanGenInput):
     return {"status": "ok", "plan_file": "/files/studyplan.csv", "summary": plan}
 
 # =========================
-# Obsidian-note export
+# NEW: Import course files via URL (Option B)
 # =========================
-@app.post("/create_obsidian_note")
-def create_obsidian_note(request: Request, payload: ObsidianNoteInput):
+@app.post("/import_course_files")
+def import_course_files(payload: ImportFilesInput, request: Request):
     """
-    Spara en Obsidian-kompatibel .md-fil
+    Hämta en lista av filer via URL och spara dem i /files.
+    Stöder bl.a. .html, .csv, .md, .pdf (andra filer skrivs också, men använd med omdöme).
+    Input: {"urls":["https://.../file1.html","https://.../schedule.csv", ...]}
     """
-    title = (payload.title or "note").strip()
-    body = payload.body_md or ""
-    safe = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_")
-    notes_dir = os.path.join(FILES_DIR, "obsidian_notes")
-    os.makedirs(notes_dir, exist_ok=True)
-    fname = f"{safe}.md"
-    fpath = os.path.join(notes_dir, fname)
-    with open(fpath, "w", encoding="utf-8") as f:
-        f.write(body)
-    return {"status": "ok", "note_url": f"{_base_url(request)}/files/obsidian_notes/{fname}"}
+    allowed = {".html", ".csv", ".md", ".pdf"}
+    saved, errors = [], []
+
+    for u in payload.urls:
+        try:
+            r = requests.get(u, timeout=30)
+            if r.status_code != 200:
+                errors.append({"url": u, "error": f"HTTP {r.status_code}"})
+                continue
+
+            name = (u.split("/")[-1] or "file").split("?")[0].split("#")[0]
+            safe = "".join(c for c in name if c.isalnum() or c in ("-", "_", ".", " ")).strip().replace(" ", "_")
+            if not safe:
+                safe = "file"
+
+            ext = "." + safe.split(".")[-1].lower() if "." in safe else ""
+            # (valfri strikt kontroll) if allowed and ext and ext not in allowed: continue
+
+            fpath = os.path.join(FILES_DIR, safe)
+            with open(fpath, "wb") as f:
+                f.write(r.content)
+
+            saved.append(f"{_base_url(request)}/files/{safe}")
+        except Exception as e:
+            errors.append({"url": u, "error": str(e)})
+
+    return {"status": "ok", "saved": saved, "errors": errors}
 
 # =========================
-# Discord daily digest (valfritt)
+# Discord daily digest (optional)
 # =========================
 DISCORD_STATE_DIR = os.path.join(FILES_DIR, "discord")
 os.makedirs(DISCORD_STATE_DIR, exist_ok=True)
@@ -701,23 +722,8 @@ def _render_digest_md(day_label: str, collected: List[Dict]):
         lines.append("")
     return "\n".join(lines)
 
-@app.post("/discord_set_channels")
-def discord_set_channels(payload: DiscordChannelsInput):
-    """Sätt kanaler som ska läsas."""
-    st = _load_state()
-    chan = payload.channel_ids or []
-    if not isinstance(chan, list) or not chan:
-        env_ids = os.environ.get("DISCORD_CHANNEL_IDS", "")
-        chan = [c.strip() for c in env_ids.split(",") if c.strip()]
-    st["channels"] = chan
-    _save_state(st)
-    return {"status": "ok", "channels": st["channels"]}
-
-@app.post("/discord_fetch_latest")
-def discord_fetch_latest(request: Request, payload: DiscordFetchInput):
-    """
-    Hämta nya meddelanden från konfigurerade kanaler och spara dags-digest.
-    """
+def _discord_fetch_latest_core(max_per_channel: int) -> Dict:
+    """Core logic for fetching + saving digest; callable from endpoint or scheduler."""
     st = _load_state()
     channels = st.get("channels", [])
     if not channels:
@@ -725,13 +731,12 @@ def discord_fetch_latest(request: Request, payload: DiscordFetchInput):
         channels = [c.strip() for c in env_ids.split(",") if c.strip()]
         st["channels"] = channels
     if not channels:
-        return {"status": "error", "message": "No channels configured. Call /discord_set_channels first."}
+        return {"status": "error", "message": "No channels configured."}
 
-    max_per = int(payload.max_per_channel)
     collected = []
     for ch in channels:
         since_id = (st.get("last_since") or {}).get(ch)
-        res = _discord_fetch_channel(ch, since_id=since_id, limit=max_per)
+        res = _discord_fetch_channel(ch, since_id=since_id, limit=max_per_channel)
         if res["status"] == "ok" and res["messages"]:
             last_id = res["messages"][-1]["id"]
             st.setdefault("last_since", {})[ch] = last_id
@@ -750,13 +755,36 @@ def discord_fetch_latest(request: Request, payload: DiscordFetchInput):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(collected, f, indent=2, ensure_ascii=False)
 
-    base = _base_url(request)
     return {
         "status": "ok",
-        "digest_md": f"{base}/files/discord/{md_name}",
-        "digest_json": f"{base}/files/discord/{json_name}",
+        "digest_md": f"/files/discord/{md_name}",
+        "digest_json": f"/files/discord/{json_name}",
         "channels": channels
     }
+
+@app.post("/discord_set_channels")
+def discord_set_channels(payload: DiscordChannelsInput):
+    """Sätt kanaler som ska läsas."""
+    st = _load_state()
+    chan = payload.channel_ids or []
+    if not isinstance(chan, list) or not chan:
+        env_ids = os.environ.get("DISCORD_CHANNEL_IDS", "")
+        chan = [c.strip() for c in env_ids.split(",") if c.strip()]
+    st["channels"] = chan
+    _save_state(st)
+    return {"status": "ok", "channels": st["channels"]}
+
+@app.post("/discord_fetch_latest")
+def discord_fetch_latest(request: Request, payload: DiscordFetchInput):
+    """
+    Hämta nya meddelanden från konfigurerade kanaler och spara dags-digest.
+    """
+    res = _discord_fetch_latest_core(payload.max_per_channel)
+    base = _base_url(request)
+    if res.get("status") == "ok":
+        res["digest_md"] = f"{base}{res['digest_md']}"
+        res["digest_json"] = f"{base}{res['digest_json']}"
+    return res
 
 def _seconds_until_next(time_str: str, tz_name: str = "Europe/Stockholm"):
     from zoneinfo import ZoneInfo
@@ -778,37 +806,11 @@ def discord_schedule_daily(payload: DiscordScheduleInput):
             wait = _seconds_until_next(at, "Europe/Stockholm")
             time.sleep(wait)
             try:
-                discord_fetch_latest(Request, DiscordFetchInput(max_per_channel=max_per))  # not used directly, see below
+                _discord_fetch_latest_core(max_per)
             except Exception:
                 pass
 
-    # Anropa fetch direkt i tråden via funktionsobjekt istället:
-    def runner():
-        while True:
-            seconds = _seconds_until_next(at, "Europe/Stockholm")
-            time.sleep(seconds)
-            try:
-                # call endpoint logic directly
-                _ = discord_fetch_latest  # just to keep reference
-            except Exception:
-                pass
-
-    threading.Thread(target=lambda: (
-        time.sleep(_seconds_until_next(at, "Europe/Stockholm")),
-        discord_fetch_latest.__wrapped__(request=None, payload=DiscordFetchInput(max_per_channel=max_per)) if hasattr(discord_fetch_latest, "__wrapped__") else None
-    ), daemon=True).start()
-
-    # Simpler periodic thread:
-    def periodic():
-        while True:
-            try:
-                discord_fetch_latest.__wrapped__(request=None, payload=DiscordFetchInput(max_per_channel=max_per)) if hasattr(discord_fetch_latest, "__wrapped__") else None
-            except Exception:
-                pass
-            time.sleep(24*3600)
-
-    threading.Thread(target=periodic, daemon=True).start()
-
+    threading.Thread(target=worker, daemon=True).start()
     return {"status": "ok", "message": f"Daily Discord digest scheduled at {at} Europe/Stockholm"}
 
 # =========================
