@@ -1,32 +1,33 @@
 import os, io, csv, re, json, zipfile, datetime, threading, time
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import requests
 from fastapi import FastAPI, Body, Request
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
 
-# ---------------------------
-# App & env
-# ---------------------------
-app = FastAPI(title="Professor Aurelius Actions API")
+# =========================
+# App & paths
+# =========================
+app = FastAPI(title="Professor Aurelius DSA Actions API")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(ROOT_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # t.ex. https://<din-service>.onrender.com
-
-# Exponera statiska filer (CSV/PNG/PDF/JSON/ZIP) via /files/...
+# Exponera statiska filer via /files/...
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _base_url(request: Request) -> str:
-    """Returnera publik bas-URL (env om satt, annars från inkommande request)."""
-    if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL.rstrip("/")
-    return str(request.base_url).rstrip("/")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
+def _base_url(request: Optional[Request]=None) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return ""
+
+# =========================
+# Helpers (GitHub, parsing)
+# =========================
 def _gh_headers():
     token = os.environ.get("GITHUB_TOKEN")
     h = {"Accept": "application/vnd.github+json"}
@@ -35,7 +36,7 @@ def _gh_headers():
     return h
 
 def _parse_repo_url(repo_url: str) -> Tuple[str, str, str, str]:
-    """Returnerar (org, repo, ref, path) för https://github.com/org/repo[/tree/<ref>/<path>]"""
+    """Return (org, repo, ref, path) for https://github.com/org/repo[/tree/<ref>/<path>]"""
     if "github.com" not in repo_url:
         raise ValueError("Not a GitHub URL")
     parts = repo_url.split("github.com/")[-1].split("/")
@@ -90,16 +91,16 @@ def _analyze_python(code: str) -> Dict:
     imports = re.findall(r"^\s*(?:from\s+[\w\.]+\s+import|import\s+[\w\.]+)", code, flags=re.M)[:12]
     return {"functions": funcs, "classes": classes, "imports": imports}
 
-# ---------------------------
+# =========================
 # Root
-# ---------------------------
+# =========================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Professor Aurelius Actions API"}
+    return {"status": "ok", "service": "Professor Aurelius DSA Actions API"}
 
-# ---------------------------
-# GitHub / Repo-analys
-# ---------------------------
+# =========================
+# Repo / GitHub
+# =========================
 @app.post("/analyze_github_repo")
 def analyze_github_repo(payload: dict = Body(...)):
     """
@@ -108,7 +109,7 @@ def analyze_github_repo(payload: dict = Body(...)):
     """
     repo_url = payload.get("repo_url", "").strip()
     if not repo_url:
-        return {"status": "error", "message": "Provide a valid GitHub URL."}
+        return {"status": "error", "message": "Provide repo_url"}
     try:
         org, repo, ref, path = _parse_repo_url(repo_url)
     except Exception:
@@ -116,7 +117,6 @@ def analyze_github_repo(payload: dict = Body(...)):
 
     exts = tuple([e.lower() for e in payload.get("extensions", [".py",".md",".pdf",".ipynb"])])
     max_files = int(payload.get("max_files", 400))
-
     items = _list_recursive(org, repo, ref, start_path=path, max_files=max_files)
     files = [it for it in items if it.get("type")=="file" and it["name"].lower().endswith(exts)]
 
@@ -137,14 +137,13 @@ def analyze_github_repo(payload: dict = Body(...)):
             except Exception:
                 pass
         summary.append(row)
-
     return {"status": "ok", "count": len(summary), "repo": f"{org}/{repo}", "ref": ref, "root": path or "", "files": summary}
 
 @app.post("/summarize_repo_for_studyplan")
 def summarize_repo_for_studyplan(payload: dict = Body(...)):
     """
     Input: {"repo_url":"...","weeks":6,"hours_per_week":8}
-    Output: fördelning av MD/PY över veckor + rekommendationer
+    Output: plan (fördelning MD/PY)
     """
     repo_url = payload.get("repo_url","").strip()
     weeks = int(payload.get("weeks", 6))
@@ -182,7 +181,7 @@ def summarize_repo_for_studyplan(payload: dict = Body(...)):
     if not topics:
         return {"status":"ok","weeks":weeks,"hours_per_week":hours,"plan":[],"note":"No MD/PY topics found."}
 
-    topics.sort(key=lambda t: (t[1]!="md", -t[2], t[0]))  # md före py; tungt först
+    topics.sort(key=lambda t: (t[1]!="md", -t[2], t[0]))  # md först; tyngst först
     buckets = [[] for _ in range(weeks)]
     for i, t in enumerate(topics):
         buckets[i % weeks].append(t)
@@ -208,7 +207,7 @@ def summarize_repo_for_studyplan(payload: dict = Body(...)):
             "week": w+1,
             "total_hours": hours,
             "items": entries,
-            "focus": "Konsolidera teori (MD) och implementera/öva kod (PY).",
+            "focus": "Konsolidera teori (MD) och öva implementation (PY).",
             "quiz_ideas": ["Begreppsquiz", "Komplexitet/Edge-cases"]
         })
 
@@ -293,13 +292,13 @@ def create_flashcards_from_repo(request: Request, payload: dict = Body(...)):
     download_url = f"{_base_url(request)}/files/{fname}"
     return {"status":"ok","count":len(pairs),"download_url":download_url}
 
-# ---------------------------
+# =========================
 # Labbar (Chalmers GitLab)
-# ---------------------------
+# =========================
 @app.post("/fetch_lab_repo")
 def fetch_lab_repo(request: Request, payload: dict = Body(...)):
     """
-    Hämtar en specifik labb (ZIP) och extraherar lokalt.
+    Hämtar specifik labb (ZIP) och extraherar lokalt.
     Input: {"lab_number":1,"year":2025,"term":"lp2"}
     """
     lab_number = int(payload.get("lab_number", 0))
@@ -338,7 +337,7 @@ def fetch_lab_repo(request: Request, payload: dict = Body(...)):
 @app.post("/auto_check_labs")
 def auto_check_labs(payload: dict = Body(...)):
     """
-    Kollar lab-1..lab-N, laddar ner nya om de finns och inte redan finns lokalt.
+    Kolla lab-1..lab-N, ladda ner nya om de finns och saknas lokalt.
     Input: {"year":2025,"term":"lp2","max_labs":4}
     """
     year = int(payload.get("year", datetime.datetime.now().year))
@@ -383,7 +382,7 @@ def auto_check_labs(payload: dict = Body(...)):
 @app.post("/analyze_lab_files")
 def analyze_lab_files(payload: dict = Body(...)):
     """
-    Läser README.md + .py i /files/labs/<lab-N>/ och skapar <lab-N>_summary.json
+    Läs README.md + .py i /files/labs/<lab-N>/ och skapa <lab-N>_summary.json
     Input: {"lab_name":"lab-2"}
     """
     lab_name = payload.get("lab_name")
@@ -416,7 +415,7 @@ def analyze_lab_files(payload: dict = Body(...)):
 @app.post("/schedule_lab_check")
 def schedule_lab_check(payload: dict = Body(...)):
     """
-    Startar bakgrundsjobb som kör auto_check_labs var 'interval_days' och analyserar nya labbar.
+    Starta bakgrundsjobb som kör auto_check_labs var 'interval_days' och analyserar nya labbar.
     Input: {"year":2025,"term":"lp2","max_labs":4,"interval_days":14}
     """
     year = int(payload.get("year", datetime.datetime.now().year))
@@ -434,13 +433,13 @@ def schedule_lab_check(payload: dict = Body(...)):
     threading.Thread(target=job, daemon=True).start()
     return {"status":"ok","message":f"Lab check scheduled every {interval_days} days."}
 
-# ---------------------------
+# =========================
 # Tentor
-# ---------------------------
+# =========================
 @app.post("/analyze_exams_repo")
 def analyze_exams_repo(payload: dict = Body(...)):
     """
-    Hämtar pdf-tentor från past-exams-repo och bygger exam_summary.json
+    Hämta pdf-tentor från past-exams-repo och bygg exam_summary.json
     Input: {"repo_url":"https://github.com/.../past-exams","max_exams":20}
     """
     repo_url = payload.get("repo_url","").strip()
@@ -478,13 +477,13 @@ def analyze_exams_repo(payload: dict = Body(...)):
         json.dump(summary, f, indent=2, ensure_ascii=False)
     return {"status":"ok","count":len(summary),"summary_file":"/files/exams/exam_summary.json"}
 
-# ---------------------------
-# Kursmaterial (HTML/CSV) → summary + studieplan
-# ---------------------------
+# =========================
+# Kursmaterial (HTML/CSV) -> summary + studieplan
+# =========================
 @app.post("/analyze_course_material")
 def analyze_course_material(payload: dict = Body(...)):
     """
-    Läser alla .html/.csv i /files och skapar course_summary.json
+    Läs .html/.csv i /files och skapa course_summary.json
     Input: {"course_name":"Data Structures and Algorithms"}
     """
     course_name = payload.get("course_name", "Data Structures and Algorithms")
@@ -527,7 +526,7 @@ def analyze_course_material(payload: dict = Body(...)):
 @app.post("/generate_studyplan_from_summary")
 def generate_studyplan_from_summary(payload: dict = Body(...)):
     """
-    Skapar studieplan från course_summary.json
+    Skapa studieplan från course_summary.json
     Input: {"weeks":6,"hours_per_week":10,"focus":["exam_topics","labs_info","modules"]}
     """
     weeks = int(payload.get("weeks", 6))
@@ -577,3 +576,170 @@ def generate_studyplan_from_summary(payload: dict = Body(...)):
             writer.writerow([w["week"], w["hours"], "; ".join(w["topics"]), "; ".join(w["labs"])])
 
     return {"status":"ok","plan_file":"/files/studyplan.csv","summary":plan}
+
+# =========================
+# Obsidian-note export
+# =========================
+@app.post("/create_obsidian_note")
+def create_obsidian_note(request: Request, payload: dict = Body(...)):
+    """
+    Spara en Obsidian-kompatibel .md-fil
+    Input: {
+      "title":"Binary Search – korrekthet",
+      "body_md":"<Hela markdown-innehållet (inkl YAML-frontmatter om du vill)>"
+    }
+    Output: {"status":"ok","note_url":"..."}
+    """
+    title = (payload.get("title") or "note").strip()
+    body = payload.get("body_md") or ""
+    safe = "".join(c for c in title if c.isalnum() or c in (" ","-","_")).strip().replace(" ", "_")
+    notes_dir = os.path.join(FILES_DIR, "obsidian_notes")
+    os.makedirs(notes_dir, exist_ok=True)
+    fname = f"{safe}.md"
+    fpath = os.path.join(notes_dir, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(body)
+    return {"status":"ok","note_url": f"{_base_url(request)}/files/obsidian_notes/{fname}"}
+
+# =========================
+# Discord daily digest (valfritt)
+# =========================
+DISCORD_STATE_DIR = os.path.join(FILES_DIR, "discord")
+os.makedirs(DISCORD_STATE_DIR, exist_ok=True)
+DISCORD_STATE_FILE = os.path.join(DISCORD_STATE_DIR, "state.json")
+
+def _discord_headers():
+    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
+    return {"Authorization": f"Bot {token}"}
+
+def _load_state():
+    if os.path.exists(DISCORD_STATE_FILE):
+        with open(DISCORD_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"channels": [], "last_since": {}}
+
+def _save_state(st):
+    with open(DISCORD_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2, ensure_ascii=False)
+
+def _discord_fetch_channel(channel_id: str, since_id: Optional[str] = None, limit: int = 100):
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    params = {"limit": min(limit, 100)}
+    if since_id:
+        params["after"] = since_id
+    r = requests.get(url, headers=_discord_headers(), params=params, timeout=20)
+    if r.status_code != 200:
+        return {"channel": channel_id, "status": "error", "http": r.status_code, "messages": []}
+    msgs = r.json()
+    msgs = sorted(msgs, key=lambda m: m.get("id"))
+    return {"channel": channel_id, "status": "ok", "messages": msgs}
+
+def _render_digest_md(day_label: str, collected: list[dict]):
+    lines = [f"# Discord-digest {day_label}", ""]
+    for block in collected:
+        ch = block["channel"]
+        msgs = block["messages"]
+        lines.append(f"## Kanal {ch}")
+        if not msgs:
+            lines.append("_Inga nya meddelanden._")
+        for m in msgs:
+            ts = m.get("timestamp","")[:19].replace("T"," ")
+            author = (m.get("author") or {}).get("username","unknown")
+            content = (m.get("content") or "").replace("\r","").strip() or "[Bifogning/Embed]"
+            lines.append(f"- **{ts} – {author}:** {content}")
+        lines.append("")
+    return "\n".join(lines)
+
+@app.post("/discord_set_channels")
+def discord_set_channels(payload: dict = Body(...)):
+    """Input: {"channel_ids": ["123","456"]} eller sätt env DISCORD_CHANNEL_IDS."""
+    st = _load_state()
+    chan = payload.get("channel_ids") or []
+    if not isinstance(chan, list) or not chan:
+        env_ids = os.environ.get("DISCORD_CHANNEL_IDS", "")
+        chan = [c.strip() for c in env_ids.split(",") if c.strip()]
+    st["channels"] = chan
+    _save_state(st)
+    return {"status": "ok", "channels": st["channels"]}
+
+@app.post("/discord_fetch_latest")
+def discord_fetch_latest(request: Request, payload: dict = Body(...)):
+    """
+    Hämta nya meddelanden från konfigurerade kanaler och spara dags-digest.
+    Input: {"max_per_channel": 100}
+    """
+    st = _load_state()
+    channels = st.get("channels", [])
+    if not channels:
+        env_ids = os.environ.get("DISCORD_CHANNEL_IDS", "")
+        channels = [c.strip() for c in env_ids.split(",") if c.strip()]
+        st["channels"] = channels
+    if not channels:
+        return {"status":"error","message":"No channels configured. Call /discord_set_channels first."}
+
+    max_per = int(payload.get("max_per_channel", 100))
+    collected = []
+    for ch in channels:
+        since_id = (st.get("last_since") or {}).get(ch)
+        res = _discord_fetch_channel(ch, since_id=since_id, limit=max_per)
+        if res["status"] == "ok" and res["messages"]:
+            last_id = res["messages"][-1]["id"]
+            st.setdefault("last_since", {})[ch] = last_id
+        collected.append(res)
+    _save_state(st)
+
+    today = datetime.datetime.now(datetime.timezone.utc).astimezone().date().isoformat()
+    md = _render_digest_md(today, collected)
+    md_name = f"digest-{today}.md"
+    md_path = os.path.join(DISCORD_STATE_DIR, md_name)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md)
+
+    json_name = f"digest-{today}.json"
+    json_path = os.path.join(DISCORD_STATE_DIR, json_name)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(collected, f, indent=2, ensure_ascii=False)
+
+    base = _base_url(request)
+    return {
+        "status":"ok",
+        "digest_md": f"{base}/files/discord/{md_name}",
+        "digest_json": f"{base}/files/discord/{json_name}",
+        "channels": channels
+    }
+
+def _seconds_until_next(time_str: str, tz_name: str = "Europe/Stockholm"):
+    from zoneinfo import ZoneInfo
+    hour, minute = map(int, time_str.split(":"))
+    now = datetime.datetime.now(ZoneInfo(tz_name))
+    next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += datetime.timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+@app.post("/discord_schedule_daily")
+def discord_schedule_daily(payload: dict = Body(...)):
+    """Input: {"time":"08:00","max_per_channel":100} – schemalägg daglig digest."""
+    at = payload.get("time", "08:00")
+    max_per = int(payload.get("max_per_channel", 100))
+
+    def worker():
+        while True:
+            wait = _seconds_until_next(at, "Europe/Stockholm")
+            time.sleep(wait)
+            try:
+                discord_fetch_latest({"max_per_channel": max_per})
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"status":"ok","message":f"Daily Discord digest scheduled at {at} Europe/Stockholm"}
+
+# =========================
+# Run (Render uses: python server.py)
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
