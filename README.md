@@ -1,30 +1,28 @@
+# Professor Aurelius DSA Actions API
 
-# Professor Aurelius Actions API (Render-ready)
+🚀 **Render-ready FastAPI backend** for the *Data Structures & Algorithms GPT*.  
+Implements endpoints for:
+- 🔍 Analyzing GitHub repos (`dsabook`, `past-exams`)
+- 📘 Parsing course HTML & CSV files
+- 🧪 Fetching and auto-checking Chalmers GitLab labs
+- 🧩 Generating study plans & flashcards
+- 🗒️ Creating Obsidian-compatible notes
+- 💬 Fetching Discord announcements (optional)
 
-This is a FastAPI backend implementing eight endpoints used by your GPT Actions:
-- /schedule_study
-- /generate_flashcards
-- /tenta_stats
-- /generate_exam
-- /export_proof
-- /weekly_report
-- /gap_analysis
-- /grade_quiz
+---
 
-## Deploy on Render (Free)
+## 🌐 Deploy on Render
 
-1. Create a new GitHub repo and push these files (`server.py`, `requirements.txt`).
-2. On https://render.com: **New → Web Service → Connect Repo**.
-3. Environment: **Python 3.11+**.
-4. Build command: `pip install -r requirements.txt`
-5. Start command: `python server.py`  (Render will set `PORT`; server uses it automatically)
-6. When deployed, note your base URL, e.g. `https://aurelius-actions.onrender.com`.
+### 1. Environment variables
 
-## Use in GPT Builder Actions
+| Key | Example value | Purpose |
+|-----|----------------|----------|
+| `PYTHON_VERSION` | `3.11.9` | Ensures consistent runtime |
+| `PUBLIC_BASE_URL` | `https://aurelius-actions-server.onrender.com` | Used for absolute URLs in responses |
+| `GITHUB_TOKEN` *(optional)* | `<your_personal_token>` | Higher GitHub API rate limits |
+| `DISCORD_BOT_TOKEN` *(optional)* | `<your_discord_bot_token>` | Enables /discord_ actions |
+| `DISCORD_CHANNEL_IDS` *(optional)* | `123,456,789` | Preconfigured Discord channels |
 
-- In "Add Action", paste your OpenAPI schema (the JSON files I provided) and set the server URL to your Render URL.
-- Alternatively, you can let GPT autodiscover from `https://YOUR_URL/openapi.json` (FastAPI serves it automatically).
-
-## Files endpoint
-Generated files (CSV, PNG, PDFs) are served from `/files/{filename}`.
-
+**Build command**
+```bash
+pip install -r requirements.txt
