@@ -97,14 +97,38 @@ class ImportFilesInput(BaseModel):
     urls: List[str] = Field(..., description="List of absolute URLs to fetch and store under /files")
 
 # =========================
-# Helpers (GitHub, parsing)
+# Helpers (GitHub, parsing) — UPDATED: Trees API + Raw + Retries
 # =========================
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+USER_AGENT = "Aurelius-DSA-Actions/1.0 (+https://render.com)"
+DEFAULT_TIMEOUT = (5, 25)           # (connect, read)
+MAX_FILES_DEFAULT = 300
+MAX_BYTES_PER_FILE = 200_000        # 200 kB per file when fetching text
+
+# One shared session with retries/backoff
+SESSION = requests.Session()
+_retry = Retry(
+    total=5,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "HEAD"]
+)
+SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
+SESSION.headers.update({"User-Agent": USER_AGENT})
+
 def _gh_headers():
     token = os.environ.get("GITHUB_TOKEN")
-    h = {"Accept": "application/vnd.github+json"}
+    h = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
     if token:
         h["Authorization"] = f"token {token}"
     return h
+
+def _gh_get(url: str, params: dict | None = None):
+    r = SESSION.get(url, headers=_gh_headers(), params=params, timeout=DEFAULT_TIMEOUT)
+    r.raise_for_status()
+    return r
 
 def _parse_repo_url(repo_url: str) -> Tuple[str, str, str, str]:
     """Return (org, repo, ref, path) for https://github.com/org/repo[/tree/<ref>/<path>]"""
@@ -120,37 +144,34 @@ def _parse_repo_url(repo_url: str) -> Tuple[str, str, str, str]:
         path = bits[1] if len(bits) > 1 else ""
     return org, repo, ref, path
 
-def _contents_api(org: str, repo: str) -> str:
-    return f"https://api.github.com/repos/{org}/{repo}/contents"
+def _list_via_tree(org: str, repo: str, ref: str) -> List[Dict]:
+    """List the entire repository tree in a single call via Git Trees API."""
+    url = f"https://api.github.com/repos/{org}/{repo}/git/trees/{ref}"
+    r = _gh_get(url, params={"recursive": "1"})
+    data = r.json()
+    return data.get("tree", [])  # entries: {'path','type'('blob'|'tree'),'sha',...}
 
-def _list_recursive(org: str, repo: str, ref: str, start_path: str = "", max_files: int = 400) -> List[Dict]:
-    """Rekursivt via GitHub Contents API; respekterar max_files."""
-    stack = [start_path]
-    files = []
-    headers = _gh_headers()
-    seen = set()
-    while stack and len(files) < max_files:
-        path = stack.pop()
-        api = _contents_api(org, repo)
-        url = f"{api}/{path}" if path else api
-        r = requests.get(url, params={"ref": ref}, headers=headers, timeout=20)
-        if r.status_code != 200:
-            continue
-        items = r.json()
-        if isinstance(items, dict) and items.get("type") == "file":
-            items = [items]
-        for it in items:
-            if it.get("type") == "dir":
-                p = it.get("path")
-                if p and p not in seen:
-                    seen.add(p)
-                    stack.append(p)
-            elif it.get("type") == "file":
-                files.append(it)
-                if len(files) >= max_files:
-                    break
-    return files
+def _raw_url(org: str, repo: str, ref: str, path: str) -> str:
+    return f"https://raw.githubusercontent.com/{org}/{repo}/{ref}/{path}"
 
+def _blob_url(org: str, repo: str, ref: str, path: str) -> str:
+    return f"https://github.com/{org}/{repo}/blob/{ref}/{path}"
+
+def _safe_fetch_text(url: str, max_bytes: int = MAX_BYTES_PER_FILE) -> str:
+    """Fetch text with a byte cap to avoid huge files/timeouts."""
+    with SESSION.get(url, stream=True, timeout=DEFAULT_TIMEOUT) as r:
+        r.raise_for_status()
+        chunks, total = [], 0
+        for chunk in r.iter_content(chunk_size=8192):
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+# --- analyzers (unchanged) ---
 def _analyze_text_md(text: str) -> Dict:
     heads = re.findall(r"^#+\s+(.+)$", text, flags=re.M)[:10]
     code_blocks = len(re.findall(r"```", text))
@@ -174,191 +195,167 @@ def root():
 # =========================
 @app.post("/analyze_github_repo")
 def analyze_github_repo(payload: GenericRepoInput):
-    """
-    Input: GenericRepoInput
-    """
     repo_url = payload.repo_url.strip()
-    if not repo_url:
-        return {"status": "error", "message": "Provide repo_url"}
     try:
-        org, repo, ref, path = _parse_repo_url(repo_url)
+        org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
         return {"status": "error", "message": "Invalid GitHub URL"}
 
-    exts = tuple([e.lower() for e in (payload.extensions or [".py", ".md", ".pdf", ".ipynb"])])
-    max_files = int(payload.max_files or 400)
-    items = _list_recursive(org, repo, ref, start_path=path, max_files=max_files)
-    files = [it for it in items if it.get("type") == "file" and it["name"].lower().endswith(exts)]
+    exts = tuple([e.lower() for e in (payload.extensions or [".py",".md",".pdf",".ipynb"])])
+    max_files = int(payload.max_files or MAX_FILES_DEFAULT)
 
-    summary = []
-    headers = _gh_headers()
-    for f in files:
-        name = f["name"]
-        url = f.get("download_url")
-        kind = name.split(".")[-1].lower()
-        row = {"name": name, "path": f.get("path"), "size": f.get("size"), "type": kind, "download_url": url}
-        if url and kind in ("py", "md"):
+    tree = _list_via_tree(org, repo, ref)
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
+    blobs = [t for t in tree if t.get("type")=="blob" and t["path"].lower().endswith(exts) and in_sub(t["path"])]
+    blobs = blobs[:max_files]
+
+    out = []
+    for t in blobs:
+        path = t["path"]; name = os.path.basename(path); kind = name.split(".")[-1].lower()
+        raw = _raw_url(org, repo, ref, path)
+        row = {"name": name, "path": path, "type": kind, "download_url": raw, "web_url": _blob_url(org, repo, ref, path)}
+        if kind in ("py","md"):
             try:
-                text = requests.get(url, headers=headers, timeout=20).text
-                if kind == "py":
-                    row.update(_analyze_python(text))
-                elif kind == "md":
-                    row.update(_analyze_text_md(text))
+                text = _safe_fetch_text(raw)
+                row.update(_analyze_python(text) if kind=="py" else _analyze_text_md(text))
             except Exception:
                 pass
-        summary.append(row)
-    return {"status": "ok", "count": len(summary), "repo": f"{org}/{repo}", "ref": ref, "root": path or "", "files": summary}
+        out.append(row)
+
+    return {"status":"ok","repo":f"{org}/{repo}","ref":ref,"root":subpath or "", "count":len(out), "files": out}
 
 @app.post("/summarize_repo_for_studyplan")
 def summarize_repo_for_studyplan(payload: StudyPlanInput):
-    """
-    Input: StudyPlanInput
-    """
     repo_url = payload.repo_url.strip()
-    weeks = int(payload.weeks)
-    hours = int(payload.hours_per_week)
-    if not repo_url:
-        return {"status": "error", "message": "Missing repo_url"}
+    weeks = int(payload.weeks or 6)
+    hours = int(payload.hours_per_week or 8)
     try:
-        org, repo, ref, path = _parse_repo_url(repo_url)
+        org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
-        return {"status": "error", "message": "Invalid GitHub URL"}
+        return {"status":"error","message":"Invalid GitHub URL"}
 
-    items = _list_recursive(org, repo, ref, start_path=path)
-    files = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith((".md", ".py"))][:400]
+    tree = _list_via_tree(org, repo, ref)
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
+    cand = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith((".md",".py"))][:MAX_FILES_DEFAULT]
 
     topics = []
-    headers = _gh_headers()
-    for f in files:
-        dl = f.get("download_url")
-        name = f["name"].lower()
-        if not dl:
-            continue
+    for t in cand:
+        path = t["path"]; name = os.path.basename(path).lower()
+        raw = _raw_url(org, repo, ref, path)
         try:
-            text = requests.get(dl, headers=headers, timeout=20).text
+            text = _safe_fetch_text(raw)
         except Exception:
             continue
         if name.endswith(".md"):
             info = _analyze_text_md(text)
-            w = min(3, max(1, len(info.get("headings", [])) // 3))
-            topics.append((f["path"], "md", w, {"headings": info.get("headings", [])[:8]}))
+            w = min(3, max(1, len(info.get("headings",[]))//3))
+            topics.append((path, "md", w, {"headings": info.get("headings",[])[:8]}))
         else:
             info = _analyze_python(text)
-            w = min(3, max(1, (info.get("functions", 0) + info.get("classes", 0)) // 3))
-            topics.append((f["path"], "py", max(1, w), {"functions": info.get("functions", 0), "classes": info.get("classes", 0)}))
+            w = min(3, max(1, (info.get("functions",0)+info.get("classes",0))//3))
+            topics.append((path, "py", max(1,w), {"functions": info.get("functions",0), "classes": info.get("classes",0)}))
 
     if not topics:
-        return {"status": "ok", "weeks": weeks, "hours_per_week": hours, "plan": [], "note": "No MD/PY topics found."}
+        return {"status":"ok","repo":f"{org}/{repo}","ref":ref,"weeks":weeks,"hours_per_week":hours,"plan":[],"note":"No MD/PY topics found."}
 
-    topics.sort(key=lambda t: (t[1] != "md", -t[2], t[0]))  # md först; tyngst först
+    topics.sort(key=lambda t: (t[1]!="md", -t[2], t[0]))
     buckets = [[] for _ in range(weeks)]
     for i, t in enumerate(topics):
         buckets[i % weeks].append(t)
 
     plan = []
     for w in range(weeks):
-        entries = []
+        items = []
+        N = max(1, len(buckets[w]))
         for path_item, kind, weight, meta in buckets[w]:
             entry = {
                 "path": path_item,
-                "type": "markdown" if kind == "md" else "python",
-                "suggested_hours": max(1, weight * (hours // max(1, len(buckets[w])))),
+                "type": "markdown" if kind=="md" else "python",
+                "suggested_hours": max(1, weight * (hours // N)),
                 "meta": meta
             }
             if kind == "md" and meta.get("headings"):
                 entry["flashcard_suggestions"] = meta["headings"]
             elif kind == "py":
-                fc = meta.get("functions", 0) + meta.get("classes", 0)
-                entry["practice_suggestions"] = [f"Skapa tester för {fc} funktioner/klasser"]
-            entries.append(entry)
+                fc = meta.get("functions",0)+meta.get("classes",0)
+                entry["practice_suggestions"] = [f"Skriv tester för {fc} funktioner/klasser"]
+            items.append(entry)
+        plan.append({"week": w+1, "total_hours": hours, "items": items})
 
-        plan.append({
-            "week": w + 1,
-            "total_hours": hours,
-            "items": entries,
-            "focus": "Konsolidera teori (MD) och öva implementation (PY).",
-            "quiz_ideas": ["Begreppsquiz", "Komplexitet/Edge-cases"]
-        })
-
-    return {"status": "ok", "repo": f"{org}/{repo}", "ref": ref, "weeks": weeks, "hours_per_week": hours, "plan": plan}
+    return {"status":"ok","repo":f"{org}/{repo}","ref":ref,"weeks":weeks,"hours_per_week":hours,"plan":plan}
 
 @app.post("/list_past_exams")
 def list_past_exams(payload: GenericRepoInput):
-    """
-    Input: GenericRepoInput (use repo_url pointing to past-exams[/tree/<ref>/<path>])
-    """
     repo_url = payload.repo_url.strip()
-    if not repo_url:
-        return {"status": "error", "message": "Missing repo_url"}
     try:
-        org, repo, ref, path = _parse_repo_url(repo_url)
+        org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
-        return {"status": "error", "message": "Invalid GitHub URL"}
+        return {"status":"error","message":"Invalid GitHub URL"}
 
-    items = _list_recursive(org, repo, ref, start_path=path)
+    exam_pats = {"exam.pdf","midterm.pdf","final.pdf"}
+    sol_pats  = {"solutions.pdf","solution.pdf","answers.pdf","key.pdf"}
+
+    tree = _list_via_tree(org, repo, ref)
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
+    files = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith(".pdf")]
+
     by_dir = {}
-    exam_pats = {"exam.pdf", "midterm.pdf", "final.pdf"}
-    sol_pats = {"solutions.pdf", "solution.pdf", "answers.pdf", "key.pdf"}
-
-    for f in items:
-        if f.get("type") != "file":
-            continue
-        p = f.get("path", "")
-        folder = p.rsplit("/", 1)[0] if "/" in p else ""
-        name = f.get("name", "").lower()
+    for t in files:
+        path = t["path"]
+        folder = path.rsplit("/",1)[0] if "/" in path else ""
+        name = os.path.basename(path).lower()
         if name in exam_pats:
-            by_dir.setdefault(folder, {})["exam_url"] = f.get("download_url")
+            by_dir.setdefault(folder, {})["exam_url"] = _raw_url(org, repo, ref, path)
+            by_dir[folder]["exam_web"] = _blob_url(org, repo, ref, path)
         if name in sol_pats:
-            by_dir.setdefault(folder, {})["solution_url"] = f.get("download_url")
+            by_dir.setdefault(folder, {})["solution_url"] = _raw_url(org, repo, ref, path)
+            by_dir[folder]["solution_web"] = _blob_url(org, repo, ref, path)
 
-    rows = [{"folder": k, **v} for k, v in sorted(by_dir.items())]
-    return {"status": "ok", "count": len(rows), "items": rows}
+    rows = [{"folder":k, **v} for k,v in sorted(by_dir.items())]
+    return {"status":"ok","count":len(rows),"items":rows}
 
 @app.post("/create_flashcards_from_repo")
 def create_flashcards_from_repo(request: Request, payload: GenericRepoInput):
-    """
-    Create a CSV of flashcards from MD headings in a repo.
-    """
     repo_url = payload.repo_url.strip()
-    if not repo_url:
-        return {"status": "error", "message": "Missing repo_url"}
-
-    back_tmpl = "Förklara kort och ge ett exempel."
     topic = "repo_flashcards"
+    back_tmpl = "Förklara kort och ge ett exempel."
+    max_files = int(payload.max_files or 200)
 
     try:
-        org, repo, ref, path = _parse_repo_url(repo_url)
+        org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
-        return {"status": "error", "message": "Invalid GitHub URL"}
+        return {"status":"error","message":"Invalid GitHub URL"}
 
-    items = _list_recursive(org, repo, ref, start_path=path, max_files=payload.max_files or 400)
-    md_files = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith(".md")][:200]
+    tree = _list_via_tree(org, repo, ref)
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
+    md_blobs = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith(".md")][:max_files]
 
-    headers = _gh_headers()
     pairs = []
-    for f in md_files:
-        dl = f.get("download_url")
-        if not dl:
-            continue
+    for t in md_blobs:
+        raw = _raw_url(org, repo, ref, t["path"])
         try:
-            text = requests.get(dl, headers=headers, timeout=20).text
+            text = _safe_fetch_text(raw)
             info = _analyze_text_md(text)
             for h in info.get("headings", []):
                 pairs.append([h, back_tmpl])
         except Exception:
             continue
 
-    safe_topic = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in topic)
+    safe_topic = "".join(c if c.isalnum() or c in ("_","-") else "_" for c in topic)
     fname = f"{safe_topic}_flashcards.csv"
     fpath = os.path.join(FILES_DIR, fname)
     with open(fpath, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Framsida", "Baksida"])
-        for a, b in pairs:
-            w.writerow([a, b])
+        w = csv.writer(f); w.writerow(["Framsida","Baksida"])
+        for a,b in pairs:
+            w.writerow([a,b])
 
-    download_url = f"{_base_url(request)}/files/{fname}"
-    return {"status": "ok", "count": len(pairs), "download_url": download_url}
+    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return {"status":"ok","count":len(pairs),"download_url":f"{base}/files/{fname}"}
+
 
 # =========================
 # Labbar (Chalmers GitLab)
@@ -497,43 +494,44 @@ def schedule_lab_check(payload: ScheduleLabInput):
 # =========================
 @app.post("/analyze_exams_repo")
 def analyze_exams_repo(payload: ExamRepoInput):
-    """
-    Hämta pdf-tentor från past-exams-repo och bygg exam_summary.json
-    """
     repo_url = payload.repo_url.strip()
-    max_exams = int(payload.max_exams)
-    if not repo_url:
-        return {"status": "error", "message": "Missing repo_url"}
+    max_exams = int(payload.max_exams or 40)
     try:
-        org, repo, ref, path = _parse_repo_url(repo_url)
+        org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
-        return {"status": "error", "message": "Invalid repo_url"}
+        return {"status":"error","message":"Invalid repo_url"}
 
-    items = _list_recursive(org, repo, ref, start_path=path)
-    pdfs = [f for f in items if f.get("type") == "file" and f.get("name", "").lower().endswith(".pdf")][:max_exams]
+    tree = _list_via_tree(org, repo, ref)
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
+    pdfs = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith(".pdf")]
+    pdfs = pdfs[:max_exams]
 
     exams_dir = os.path.join(FILES_DIR, "exams")
     os.makedirs(exams_dir, exist_ok=True)
 
-    headers = _gh_headers()
     summary = []
-    for f in pdfs:
-        name, url = f["name"], f["download_url"]
+    for t in pdfs:
+        path = t["path"]; name = os.path.basename(path)
+        raw = _raw_url(org, repo, ref, path)
         local_path = os.path.join(exams_dir, name)
-        if not os.path.exists(local_path) and url:
+        if not os.path.exists(local_path):
             try:
-                r = requests.get(url, headers=headers, timeout=25)
-                if r.status_code == 200:
+                with SESSION.get(raw, timeout=DEFAULT_TIMEOUT, stream=True) as r:
+                    r.raise_for_status()
                     with open(local_path, "wb") as fp:
-                        fp.write(r.content)
+                        for chunk in r.iter_content(8192):
+                            if chunk: fp.write(chunk)
             except Exception:
                 continue
-        summary.append({"name": name, "path": f.get("path"), "size": f.get("size"), "url": url})
+        summary.append({"name": name, "path": path, "url": raw, "web_url": _blob_url(org, repo, ref, path)})
 
     outpath = os.path.join(exams_dir, "exam_summary.json")
     with open(outpath, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    return {"status": "ok", "count": len(summary), "summary_file": "/files/exams/exam_summary.json"}
+
+    return {"status":"ok","count":len(summary),"summary_file":"/files/exams/exam_summary.json"}
+
 
 # =========================
 # Kursmaterial (HTML/CSV) -> summary + studieplan
