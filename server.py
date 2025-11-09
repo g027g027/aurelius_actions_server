@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
-
+from pypdf import PdfReader
 # =========================
 # FastAPI app (incl. servers for GPT import)
 # =========================
@@ -26,6 +26,51 @@ os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+TOPIC_KEYWORDS = {
+    "sorting": ["sort", "quicksort", "mergesort", "heapsort", "insertion", "selection"],
+    "trees": ["tree", "bst", "avl", "red-black", "splay"],
+    "heaps": ["heap", "priority queue"],
+    "hashing": ["hash", "hashtable", "hash table"],
+    "graphs": ["graph", "bfs", "dfs", "dijkstra", "mst", "kruskal", "prim", "topological"],
+    "complexity": ["big-o", "o(", "omega(", "theta(", "time complexity", "space complexity"],
+    "dp": ["dynamic programming", "recurrence", "memoization", "tabulation"],
+    "greedy": ["greedy", "exchange argument"],
+}
+
+QUESTION_PATTERNS = re.compile(r"\b(question|problem|uppgift)\b", re.IGNORECASE)
+
+def _extract_pdf_info(local_path: str) -> dict:
+    info = {"pages": None, "questions_count": None, "topics": [], "text_extracted": False}
+    try:
+        reader = PdfReader(local_path)
+        info["pages"] = len(reader.pages)
+        # Försök enkel textextraktion (kan misslyckas för scannade pdf:er)
+        text_chunks = []
+        for i, page in enumerate(reader.pages[:20]):  # cap:a första 20 sidor
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt:
+                text_chunks.append(txt)
+        full = "\n".join(text_chunks)
+        if full.strip():
+            info["text_extracted"] = True
+            info["questions_count"] = len(QUESTION_PATTERNS.findall(full))
+            # Topic heuristics (case-insensitiv)
+            low = full.lower()
+            topics = []
+            for topic, keys in TOPIC_KEYWORDS.items():
+                if any(k.lower() in low for k in keys):
+                    topics.append(topic)
+            info["topics"] = sorted(set(topics))
+        else:
+            info["questions_count"] = None
+    except Exception:
+        pass
+    return info
+
 
 def _base_url(request: Optional[Request] = None) -> str:
     if PUBLIC_BASE_URL:
@@ -494,43 +539,118 @@ def schedule_lab_check(payload: ScheduleLabInput):
 # =========================
 @app.post("/analyze_exams_repo")
 def analyze_exams_repo(payload: ExamRepoInput):
+    """
+    Hämtar pdf-tentor från past-exams-repo, sparar lokalt och bygger exam_summary.json
+    Input: {"repo_url":"https://github.com/.../past-exams","max_exams":40}
+    """
     repo_url = payload.repo_url.strip()
     max_exams = int(payload.max_exams or 40)
+    if not repo_url:
+        return {"status":"error","message":"Missing repo_url"}
     try:
         org, repo, ref, subpath = _parse_repo_url(repo_url)
     except Exception:
-        return {"status":"error","message":"Invalid repo_url"}
+        return {"status":"error","message":"Invalid GitHub URL"}
 
     tree = _list_via_tree(org, repo, ref)
-    def in_sub(p: str) -> bool:
-        return (not subpath) or p == subpath or p.startswith(subpath.rstrip("/") + "/")
-    pdfs = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith(".pdf")]
-    pdfs = pdfs[:max_exams]
 
+    def in_sub(p: str) -> bool:
+        return (not subpath) or p.startswith(subpath.rstrip("/") + "/") or p == subpath
+
+    pdf_nodes = [t for t in tree if t.get("type")=="blob" and in_sub(t["path"]) and t["path"].lower().endswith(".pdf")]
+    # Gruppér per mapp (en mapp = en tenta)
+    by_dir: Dict[str, Dict[str, str]] = {}
+    for t in pdf_nodes:
+        path = t["path"]
+        folder = path.rsplit("/",1)[0] if "/" in path else ""
+        name = os.path.basename(path).lower()
+        raw = _raw_url(org, repo, ref, path)
+        web = _blob_url(org, repo, ref, path)
+        by_dir.setdefault(folder, {})
+        if name in ("exam.pdf", "exam 2025-10-29.pdf") or name.startswith("exam"):
+            by_dir[folder]["exam_url"] = raw
+            by_dir[folder]["exam_web"] = web
+            by_dir[folder]["exam_name"] = os.path.basename(path)
+        if name in ("solutions.pdf", "solutions 2025-10-29.pdf", "solution.pdf", "answers.pdf", "key.pdf") or name.startswith("solution"):
+            by_dir[folder]["solution_url"] = raw
+            by_dir[folder]["solution_web"] = web
+            by_dir[folder]["solution_name"] = os.path.basename(path)
+
+    # Hämta lokalt + analysera
     exams_dir = os.path.join(FILES_DIR, "exams")
     os.makedirs(exams_dir, exist_ok=True)
 
-    summary = []
-    for t in pdfs:
-        path = t["path"]; name = os.path.basename(path)
-        raw = _raw_url(org, repo, ref, path)
-        local_path = os.path.join(exams_dir, name)
-        if not os.path.exists(local_path):
-            try:
-                with SESSION.get(raw, timeout=DEFAULT_TIMEOUT, stream=True) as r:
-                    r.raise_for_status()
-                    with open(local_path, "wb") as fp:
-                        for chunk in r.iter_content(8192):
-                            if chunk: fp.write(chunk)
-            except Exception:
-                continue
-        summary.append({"name": name, "path": path, "url": raw, "web_url": _blob_url(org, repo, ref, path)})
+    summary_items = []
+    topic_freq: Dict[str,int] = {}
+    q_counts: List[int] = []
+
+    # Begränsa antal mappar
+    folders = sorted(by_dir.keys())[:max_exams]
+    for folder in folders:
+        record = {"folder": folder}
+        rec = by_dir[folder]
+
+        # EXAM
+        exam_local = None
+        if "exam_url" in rec:
+            exam_name = rec.get("exam_name", os.path.basename(rec["exam_url"]))
+            exam_local = os.path.join(exams_dir, f"{folder.replace('/','_')}__{exam_name}")
+            if not os.path.exists(exam_local):
+                try:
+                    with SESSION.get(rec["exam_url"], timeout=DEFAULT_TIMEOUT, stream=True) as r:
+                        r.raise_for_status()
+                        with open(exam_local, "wb") as fp:
+                            for chunk in r.iter_content(8192):
+                                if chunk: fp.write(chunk)
+                except Exception:
+                    exam_local = None
+            record["exam_url"] = rec["exam_url"]
+            record["exam_web"] = rec.get("exam_web")
+
+        # SOLUTION
+        if "solution_url" in rec:
+            sol_name = rec.get("solution_name", os.path.basename(rec["solution_url"]))
+            sol_local = os.path.join(exams_dir, f"{folder.replace('/','_')}__{sol_name}")
+            if not os.path.exists(sol_local):
+                try:
+                    with SESSION.get(rec["solution_url"], timeout=DEFAULT_TIMEOUT, stream=True) as r:
+                        r.raise_for_status()
+                        with open(sol_local, "wb") as fp:
+                            for chunk in r.iter_content(8192):
+                                if chunk: fp.write(chunk)
+                except Exception:
+                    pass
+            record["solution_url"] = rec["solution_url"]
+            record["solution_web"] = rec.get("solution_web")
+
+        # ANALYS på exam
+        if exam_local and os.path.exists(exam_local):
+            info = _extract_pdf_info(exam_local)
+            record.update(info)
+            if info.get("questions_count") is not None:
+                q_counts.append(info["questions_count"])
+            for tpc in info.get("topics", []):
+                topic_freq[tpc] = topic_freq.get(tpc, 0) + 1
+
+        summary_items.append(record)
+
+    # Aggregat
+    agg = {
+        "exam_count": len(summary_items),
+        "topic_frequency": dict(sorted(topic_freq.items(), key=lambda x: (-x[1], x[0]))),
+        "questions_per_exam": {
+            "values": q_counts,
+            "mean": (sum(q_counts)/len(q_counts)) if q_counts else None
+        }
+    }
+
+    out = {"status":"ok", "repo": f"{org}/{repo}", "ref": ref, "items": summary_items, "aggregate": agg}
 
     outpath = os.path.join(exams_dir, "exam_summary.json")
     with open(outpath, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+        json.dump(out, f, indent=2, ensure_ascii=False)
 
-    return {"status":"ok","count":len(summary),"summary_file":"/files/exams/exam_summary.json"}
+    return {"status":"ok","count":len(summary_items),"summary_file":"/files/exams/exam_summary.json"}
 
 
 # =========================
